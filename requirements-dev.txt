@@ -1,0 +1,5 @@
+-r requirements.txt
+# Test and browser automation tools; not needed to run the server
+pytest>=8,<10
+httpx>=0.27,<1
+playwright>=1.48,<2

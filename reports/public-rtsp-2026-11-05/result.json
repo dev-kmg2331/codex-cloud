@@ -1,0 +1,32 @@
+{
+  "tested_at": "2026-11-05T19:02:27.169835+09:00",
+  "base_url": "http://127.0.0.1:8000",
+  "source": "rtsp://9627b0bf2a7b.entrypoint.cloud.wowza.com:1935/app-p5260J38/66abe4b9_stream1",
+  "passed": false,
+  "browser_errors": [],
+  "health": {
+    "http_status": 200,
+    "body": {
+      "status": "ok",
+      "codec": "h264",
+      "transport": "websocket"
+    }
+  },
+  "error": "영상 소스에 연결할 수 없거나 연결이 종료되었습니다. RTSP 주소와 서버의 접근 권한을 확인하세요.",
+  "stream_status": "연결 오류",
+  "frames_total": "0",
+  "resolution": "—",
+  "source_fps": "—",
+  "logs": [
+    "19시 2분 28초",
+    "WebCodecs 준비 완료 · 연결 후 원본 H.264 프로필을 확인합니다.",
+    "19시 2분 29초",
+    "Python 서버 상태 정상 · RTSP 주소를 입력하세요.",
+    "19시 2분 30초",
+    "Python 서버를 통해 RTSP 소스에 연결합니다.",
+    "19시 2분 30초",
+    "WebSocket 연결 완료 · RTSP 영상 준비 중",
+    "19시 2분 30초",
+    "영상 소스에 연결할 수 없거나 연결이 종료되었습니다. RTSP 주소와 서버의 접근 권한을 확인하세요."
+  ]
+}

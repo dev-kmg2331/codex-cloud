@@ -1,0 +1,1 @@
+"""WebCodecs streaming demo."""

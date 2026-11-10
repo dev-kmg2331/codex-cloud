@@ -1,0 +1,17 @@
+{
+  "recorded_at": "2026-11-05T19:03:01.470865+09:00",
+  "environment": "current managed test environment",
+  "command": "python -m uvicorn server.main:app --host 0.0.0.0 --port 8000",
+  "pid": 2881,
+  "bind": "0.0.0.0:8000",
+  "public_url": null,
+  "source_sha256": {
+    "requirements.txt": "387fc113c0525ae14bfa1d0779206d90ec057f1b3a84c4ed861e30d054d1c50a",
+    "server/__init__.py": "0fdf812ece54b12f92e749a483c12ab4182a525a7919f7f1fa3c6898235986ca",
+    "server/main.py": "9447127353b2a8153b4f48f9733d47c653c860d77be9a8325b2e9a15d3a4794d",
+    "server/video.py": "19160a5785ab0ae433be714360e07a71966bae31a54cab19363c243b850c4fdb",
+    "static/app.js": "620d26d3eb9376cecd816b714c53f02bf837217cf67cfba30c618bb5d40cfd5d",
+    "static/index.html": "a215206e03da46134ff75d26486809e36609bebdd809a07af60dde9e96a1b5e2",
+    "static/style.css": "acbdb9f28b991a703a5cd1d33bd8d59b9c55e4da875b47e2f5ec72cddebf14e8"
+  }
+}

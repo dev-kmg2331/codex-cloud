@@ -1,0 +1,211 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#101616" />
+    <title>WebCodecs Lab · 영상 스트리밍 데모</title>
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%2377e8ba'/%3E%3Cpath d='m12 9 11 7-11 7z' fill='%23101616'/%3E%3C/svg%3E"
+    />
+    <link rel="stylesheet" href="/static/style.css" />
+    <script src="/static/app.js" defer></script>
+  </head>
+  <body>
+    <header class="topbar">
+      <a class="brand" href="/"
+        ><span class="brand-mark">▷</span> WebCodecs
+        <span class="brand-light">Lab</span></a
+      ><span class="version">PYTHON DEMO <span>v1.0</span></span>
+    </header>
+    <main>
+      <div class="intro">
+        <div>
+          <div class="eyebrow">REAL-TIME VIDEO PLAYGROUND</div>
+          <h1>프레임이 흐르는 순간.</h1>
+          <p>RTSP에서 브라우저까지, WebCodecs로 직접 연결하는 영상 스트리밍.</p>
+        </div>
+        <div class="server-state">
+          <span class="dot" id="server-dot"></span
+          ><span id="server-status">서버 확인 중</span>
+        </div>
+      </div>
+      <div id="notice" class="notice" role="alert" hidden></div>
+      <section class="source-panel" aria-label="영상 소스">
+        <div class="source-label">
+          <span class="tiny-square"></span> RTSP 소스
+        </div>
+        <div class="source-input">
+          <label class="sr-only" for="rtsp-url">RTSP 스트림 주소</label
+          ><input
+            id="rtsp-url"
+            type="url"
+            placeholder="rtsp://192.168.0.100:554/stream"
+            autocomplete="off"
+            spellcheck="false"
+          /><span id="source-hint"
+            >서버가 접근할 수 있는 RTSP 주소를 입력하세요.</span
+          >
+        </div>
+      </section>
+      <div class="workspace">
+        <section class="preview-panel" aria-label="영상 미리보기">
+          <div class="panel-header">
+            <h2><span class="tiny-square"></span> 라이브 미리보기</h2>
+            <span id="stream-status" class="status-tag">대기 중</span>
+          </div>
+          <div class="video-stage">
+            <canvas
+              id="video"
+              width="640"
+              height="360"
+              aria-label="WebCodecs 디코딩 영상"
+            ></canvas>
+            <div class="empty-state" id="empty-state">
+              <span class="play-outline">▷</span>
+              <h3>첫 프레임을 기다리고 있어요</h3>
+              <p>스트리밍을 시작해 실시간 영상을 확인하세요.</p>
+              <span class="empty-code">RTSP → H.264 NAL → WebCodecs</span>
+            </div>
+            <div class="video-top" id="video-overlay" hidden>
+              <span class="live-label"><span class="dot"></span> LIVE</span
+              ><span id="video-resolution">640 × 360</span>
+            </div>
+            <div class="video-bottom" id="video-caption" hidden>
+              <span id="source-caption">RTSP LIVE STREAM</span
+              ><span id="elapsed">00:00</span>
+            </div>
+          </div>
+          <div class="preview-footer">
+            <span
+              ><span class="footer-dot"></span>
+              <span id="preview-description"
+                >RTSP 주소를 입력하고 스트리밍을 시작하세요.</span
+              ></span
+            ><span class="mono">H.264 / WebSocket</span>
+          </div>
+        </section>
+        <aside class="settings-panel">
+          <div class="panel-header">
+            <h2>원본 스트림</h2>
+            <span class="muted">01 — SOURCE</span>
+          </div>
+          <form id="settings-form">
+            <fieldset id="settings" class="source-details">
+              <div class="codec-row">
+                <span>전송 방식</span><span class="codec-badge">원본 NAL</span>
+              </div>
+              <div class="codec-row">
+                <span>비디오 코덱</span><span id="source-codec">H.264</span>
+              </div>
+              <div class="codec-row">
+                <span>원본 해상도</span><span id="source-resolution">—</span>
+              </div>
+              <div class="codec-row">
+                <span>원본 프레임 레이트</span><span id="source-fps">—</span>
+              </div>
+              <div class="codec-row">
+                <span>RTSP 전송</span><span>TCP</span>
+              </div>
+              <p class="passthrough-info">
+                카메라의 압축 영상을 그대로 전달합니다. 해상도·FPS·비트레이트는
+                카메라에서 설정하세요.
+              </p>
+            </fieldset>
+            <button id="toggle-stream" type="submit">
+              <span id="button-icon">▶</span
+              ><span id="button-text">스트리밍 시작</span
+              ><span class="button-arrow">↗</span>
+            </button>
+            <p class="settings-hint">
+              서버 재인코딩 없이 원본 화질로 재생합니다.
+            </p>
+          </form>
+        </aside>
+      </div>
+      <section class="metrics" aria-label="실시간 스트림 지표">
+        <article>
+          <div class="metric-label">디코딩 속도 <span>↗</span></div>
+          <div class="metric-value">
+            <span id="metric-fps">—</span><small>fps</small>
+          </div>
+          <div class="metric-description">브라우저에서 출력한 프레임</div>
+        </article>
+        <article>
+          <div class="metric-label">수신 비트레이트 <span>⇣</span></div>
+          <div class="metric-value">
+            <span id="metric-bitrate">—</span><small>Mbps</small>
+          </div>
+          <div class="metric-description">최근 1초간 수신한 영상 데이터</div>
+        </article>
+        <article>
+          <div class="metric-label">디코딩 지연 <span>◷</span></div>
+          <div class="metric-value">
+            <span id="metric-latency">—</span><small>ms</small>
+          </div>
+          <div class="metric-description">패킷 수신부터 디코더 출력까지</div>
+        </article>
+        <article>
+          <div class="metric-label">누적 프레임 <span>▧</span></div>
+          <div class="metric-value">
+            <span id="metric-frames">0</span><small>frames</small>
+          </div>
+          <div class="metric-description">디코딩한 전체 프레임 수</div>
+        </article>
+      </section>
+      <section class="pipeline">
+        <div class="section-title">
+          <h2>스트리밍 파이프라인</h2>
+          <span>FROM SERVER TO SCREEN</span>
+        </div>
+        <div class="pipeline-steps">
+          <div>
+            <span class="step-number">01</span>
+            <div>
+              <h3>Python 서버</h3>
+              <p>RTSP 수신 · PyAV</p>
+            </div>
+            <span class="step-pill">SERVER</span>
+          </div>
+          <span class="connector">→</span>
+          <div>
+            <span class="step-number">02</span>
+            <div>
+              <h3>H.264 NAL</h3>
+              <p>RTP 재조립 · 원본 전달</p>
+            </div>
+          </div>
+          <span class="connector">→</span>
+          <div>
+            <span class="step-number">03</span>
+            <div>
+              <h3>WebSocket</h3>
+              <p>바이너리 패킷 전송</p>
+            </div>
+          </div>
+          <span class="connector">→</span>
+          <div>
+            <span class="step-number">04</span>
+            <div>
+              <h3>WebCodecs</h3>
+              <p>VideoDecoder → Canvas</p>
+            </div>
+            <span class="step-pill browser-pill">BROWSER</span>
+          </div>
+        </div>
+      </section>
+      <section class="log-panel">
+        <div class="panel-header">
+          <h2><span class="terminal-icon">›_</span> 연결 로그</h2>
+          <button type="button" id="clear-log">로그 지우기</button>
+        </div>
+        <div id="logs" role="log" aria-label="연결 이벤트 로그"></div>
+      </section>
+      <footer>
+        <span><span class="footer-dot"></span> WebCodecs API로 구동됩니다.</span
+        ><span>Chrome / Edge 권장 · localhost 또는 HTTPS 필요</span>
+      </footer>
+    </main>
+  </body>
+</html>
