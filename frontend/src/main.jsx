@@ -2,6 +2,7 @@ import React, { useEffect, useImperativeHandle, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { createFramePlayout } from './playout.js';
 import { createPlaybackSampler } from './playback-stats.js';
+import { getBboxLabelRect, projectBboxRect } from './bbox-geometry.js';
 import './style.css';
 
 const layouts = [4, 9, 16];
@@ -103,13 +104,18 @@ function drawBbox(canvas, frame, bbox, colors) {
   context.strokeStyle = colors.accent;
   context.lineWidth = Math.max(2, width / 320);
 
-  for (const { label, rect: [x1, y1, x2, y2] } of bbox.boxes) {
-    const x = x1 * width / bbox.width;
-    const y = y1 * height / bbox.height;
-    context.strokeRect(x, y, (x2 - x1) * width / bbox.width, (y2 - y1) * height / bbox.height);
+  for (const { label, rect } of bbox.boxes) {
+    const projected = projectBboxRect(rect, bbox.width, bbox.height, width, height);
+    if (!projected) continue;
+    const [x1, y1, x2, y2] = projected;
+    context.strokeRect(x1, y1, x2 - x1, y2 - y1);
     if (label) {
+      const labelRect = getBboxLabelRect(projected, context.measureText(label).width + pad * 2,
+        fontSize + pad * 2, width, height);
+      if (!labelRect) continue;
+      const [x, y, labelWidth, labelHeight] = labelRect;
       context.fillStyle = colors.accent;
-      context.fillRect(x, y, context.measureText(label).width + pad * 2, fontSize + pad * 2);
+      context.fillRect(x, y, labelWidth, labelHeight);
       context.fillStyle = colors.background;
       context.fillText(label, x + pad, y + pad);
     }
