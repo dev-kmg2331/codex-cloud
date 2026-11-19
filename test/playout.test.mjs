@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { createFramePlayout } from '../frontend/src/playout.js';
 
-function fakePlayback(t) {
+function fakePlayback(t, canRender = () => true) {
   let now = 0;
   let nextId = 0;
   const timers = new Map();
@@ -32,7 +32,10 @@ function fakePlayback(t) {
       else delete globalThis[name];
     });
   }
-  const playout = createFramePlayout((frame, bbox) => rendered.push({ pts: frame.timestamp, bbox }));
+  const playout = createFramePlayout((frame, bbox) => {
+    if (!canRender()) return false;
+    rendered.push({ pts: frame.timestamp, bbox });
+  });
   return {
     playout, rendered,
     frame(timestamp) {
@@ -115,6 +118,106 @@ test('uses BBox updates from skipped frames, holds them and applies a later empt
   clock.assertIdle();
 });
 
+test('identity and held BBox age follow the painted frame while a newer frame is still queued', t => {
+  const clock = fakePlayback(t);
+  const bbox = { ptsUs: 100_000, frameId: 'detected-frame', boxes: [{ label: 'person' }] };
+  clock.playout.addBbox(bbox);
+  clock.playout.addBbox({ ptsUs: 900_000, frameId: 'future-frame', boxes: [] });
+  clock.playout.addFrame(clock.frame(100_000), true);
+  clock.advanceTo(100);
+  clock.paint();
+  let stats = clock.playout.getStats();
+  assert.equal(stats.lastPresentedPtsUs, 100_000);
+  assert.equal(stats.appliedBboxPtsUs, 100_000);
+  assert.equal(stats.frameId, 'detected-frame');
+  assert.equal(stats.heldBboxAgeMs, 0);
+  assert.equal(stats.pendingBbox, 1);
+
+  clock.playout.addFrame(clock.frame(200_000), true);
+  clock.advanceTo(200);
+  clock.paint();
+  clock.playout.addFrame(clock.frame(900_000), true);
+  stats = clock.playout.getStats();
+  assert.equal(stats.lastPresentedPtsUs, 200_000);
+  assert.equal(stats.appliedBboxPtsUs, 100_000);
+  assert.equal(stats.frameId, 'detected-frame');
+  assert.equal(stats.heldBboxAgeMs, 100);
+
+  clock.playout.reset();
+  stats = clock.playout.getStats();
+  assert.equal(stats.lastPresentedPtsUs, null);
+  assert.equal(stats.appliedBboxPtsUs, null);
+  assert.equal(stats.frameId, null);
+  assert.equal(stats.heldBboxAgeMs, null);
+  assert.equal(stats.pendingBbox, 0);
+  clock.assertIdle();
+});
+
+test('empty BBox results replace identity and zero PTS or frame IDs remain valid', t => {
+  const clock = fakePlayback(t);
+  clock.playout.addBbox({ ptsUs: 0, frameId: 0, boxes: [{ label: 'person' }] });
+  clock.playout.addFrame(clock.frame(0), true);
+  clock.advanceTo(100);
+  clock.paint();
+  let stats = clock.playout.getStats();
+  assert.equal(stats.lastPresentedPtsUs, 0);
+  assert.equal(stats.appliedBboxPtsUs, 0);
+  assert.equal(stats.frameId, 0);
+  assert.equal(stats.heldBboxAgeMs, 0);
+
+  const empty = { ptsUs: 100_000, frameId: 'empty-result', boxes: [] };
+  clock.playout.addBbox(empty);
+  clock.playout.addFrame(clock.frame(100_000), true);
+  clock.advanceTo(200);
+  clock.paint();
+  stats = clock.playout.getStats();
+  assert.equal(clock.rendered.at(-1).bbox, empty);
+  assert.equal(stats.appliedBboxPtsUs, 100_000);
+  assert.equal(stats.frameId, 'empty-result');
+  assert.equal(stats.heldBboxAgeMs, 0);
+
+  clock.playout.addFrame(clock.frame(200_000), true);
+  clock.advanceTo(300);
+  clock.paint();
+  stats = clock.playout.getStats();
+  assert.equal(stats.frameId, 'empty-result');
+  assert.equal(stats.heldBboxAgeMs, 100);
+  clock.assertIdle();
+});
+
+test('a suppressed paint closes its frame without advancing identity or consuming pending BBox', t => {
+  let canRender = false;
+  const clock = fakePlayback(t, () => canRender);
+  const bbox = { ptsUs: 0, frameId: 'retained-result', boxes: [{ label: 'person' }] };
+  clock.playout.addBbox(bbox);
+  clock.playout.addFrame(clock.frame(0), true);
+  clock.advanceTo(100);
+  clock.paint();
+  let stats = clock.playout.getStats();
+  assert.equal(clock.rendered.length, 0);
+  assert.equal(stats.renderedFrames, 0);
+  assert.equal(stats.droppedFrames, 1);
+  assert.equal(stats.bboxApplied, 0);
+  assert.equal(stats.playoutWaitMs, 0);
+  assert.equal(stats.lastPresentedPtsUs, null);
+  assert.equal(stats.appliedBboxPtsUs, null);
+  assert.equal(stats.frameId, null);
+  assert.equal(stats.pendingBbox, 1);
+
+  canRender = true;
+  clock.playout.addFrame(clock.frame(100_000), true);
+  clock.advanceTo(200);
+  clock.paint();
+  stats = clock.playout.getStats();
+  assert.equal(clock.rendered[0].bbox, bbox);
+  assert.equal(stats.lastPresentedPtsUs, 100_000);
+  assert.equal(stats.frameId, 'retained-result');
+  assert.equal(stats.heldBboxAgeMs, 100);
+  assert.equal(stats.bboxApplied, 1);
+  assert.equal(stats.pendingBbox, 0);
+  clock.assertIdle();
+});
+
 test('BBox off coalesces decoded output until the next paint without a delay timer', t => {
   const clock = fakePlayback(t);
   clock.playout.addFrame(clock.frame(1000), false);
@@ -151,6 +254,11 @@ test('disabling BBox can release the latest queued frame immediately', t => {
   clock.playout.addFrame(clock.frame(2000), true);
   clock.playout.reset(true);
   assert.deepEqual(clock.rendered.map(frame => frame.pts), [2000]);
+  const stats = clock.playout.getStats();
+  assert.equal(stats.lastPresentedPtsUs, 2000);
+  assert.equal(stats.appliedBboxPtsUs, null);
+  assert.equal(stats.frameId, null);
+  assert.equal(stats.heldBboxAgeMs, null);
   clock.assertIdle();
 });
 

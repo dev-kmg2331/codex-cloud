@@ -6,7 +6,8 @@ const maxPendingFrameAgeMs = 250;
 export function createFramePlayout(render) {
   const frames = [];
   const boxes = new Map();
-  const stats = { renderedFrames: 0, droppedFrames: 0, bboxApplied: 0, lateBbox: 0, playoutWaitMs: 0 };
+  const stats = { renderedFrames: 0, droppedFrames: 0, bboxApplied: 0, lateBbox: 0, playoutWaitMs: 0,
+    lastPresentedPtsUs: null, appliedBboxPtsUs: null, frameId: null, heldBboxAgeMs: null };
   let wakeTimer;
   let animation;
   let lastPresentedPts = -Infinity;
@@ -21,20 +22,32 @@ export function createFramePlayout(render) {
     const { frame, receivedAt } = entry;
     const pts = frame.timestamp;
     let latestBoxPts = -Infinity;
+    let nextBbox = displayedBbox;
     for (const [boxPts, bbox] of boxes) {
       if (boxPts > pts) continue;
       if (boxPts > latestBoxPts) {
-        displayedBbox = bbox;
+        nextBbox = bbox;
         latestBoxPts = boxPts;
       }
-      boxes.delete(boxPts);
     }
-    if (latestBoxPts > -Infinity) stats.bboxApplied++;
-    lastPresentedPts = Math.max(lastPresentedPts, pts);
-    stats.playoutWaitMs = performance.now() - receivedAt;
     try {
-      render(frame, displayedBbox);
+      if (render(frame, nextBbox) === false) {
+        stats.droppedFrames++;
+        return;
+      }
+      displayedBbox = nextBbox;
+      for (const boxPts of boxes.keys()) {
+        if (boxPts <= pts) boxes.delete(boxPts);
+      }
+      if (latestBoxPts > -Infinity) stats.bboxApplied++;
+      lastPresentedPts = Math.max(lastPresentedPts, pts);
+      stats.playoutWaitMs = performance.now() - receivedAt;
       stats.renderedFrames++;
+      stats.lastPresentedPtsUs = pts;
+      stats.appliedBboxPtsUs = displayedBbox?.ptsUs ?? null;
+      stats.frameId = displayedBbox?.frameId ?? null;
+      // This is the age of the held result on the video timeline, not network latency.
+      stats.heldBboxAgeMs = stats.appliedBboxPtsUs === null ? null : (pts - stats.appliedBboxPtsUs) / 1000;
     } finally {
       frame.close();
     }
@@ -92,12 +105,16 @@ export function createFramePlayout(render) {
       boxes.clear();
       lastPresentedPts = -Infinity;
       displayedBbox = undefined;
+      stats.lastPresentedPtsUs = null;
+      stats.appliedBboxPtsUs = null;
+      stats.frameId = null;
+      stats.heldBboxAgeMs = null;
       const latest = showLatestFrame ? frames.pop() : undefined;
       for (const entry of frames.splice(0)) discard(entry);
       if (latest) present(latest);
     },
     getStats() {
-      return { ...stats, pendingFrames: frames.length,
+      return { ...stats, pendingFrames: frames.length, pendingBbox: boxes.size,
         oldestFrameAgeMs: frames.length ? performance.now() - frames[0].receivedAt : 0 };
     },
   };

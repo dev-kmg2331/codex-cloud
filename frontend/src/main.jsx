@@ -1,12 +1,87 @@
 import React, { useEffect, useImperativeHandle, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { createFramePlayout } from './playout.js';
+import { createPlaybackSampler } from './playback-stats.js';
 import './style.css';
 
 const layouts = [4, 9, 16];
 const cameraDragType = 'application/x-rtsp-camera';
 const accelerationStorageKey = 'rtsp-live.hardwareAcceleration';
+const infoOverlayStorageKey = 'rtsp-live.infoOverlay';
 const cameraTime = new Intl.DateTimeFormat('ko-KR', { hour: '2-digit', minute: '2-digit', hour12: false });
+
+function PlaybackInfo({ session, number, bboxAvailable, bboxEnabled, bboxError, compact }) {
+  const [stats, setStats] = useState(null);
+  useEffect(() => {
+    const sampler = createPlaybackSampler();
+    function sample() {
+      const current = session.current;
+      if (!current) return;
+      const snapshot = sampler.sample(current.getStats());
+      if (snapshot) setStats(snapshot);
+    }
+    sample();
+    const timer = setInterval(sample, 1000);
+    return () => clearInterval(timer);
+  }, [session, bboxAvailable, bboxEnabled, bboxError]);
+
+  const numeric = (value, digits = 0) => Number.isFinite(value) ? value.toFixed(digits) : '—';
+  const pts = value => Number.isFinite(value) ? `${(value / 1_000_000).toFixed(3)}s` : '—';
+  const bitrate = Number.isFinite(stats?.bitrateBps)
+    ? stats.bitrateBps >= 1_000_000 ? `${(stats.bitrateBps / 1_000_000).toFixed(2)} Mbps`
+      : `${Math.round(stats.bitrateBps / 1000)} kbps` : '—';
+  const bboxActive = bboxAvailable && bboxEnabled && !bboxError;
+  const bboxState = !bboxAvailable ? '미지원' : bboxError ? '오류' : !bboxEnabled ? 'OFF'
+    : stats?.appliedBboxPtsUs == null ? '대기' : 'ON';
+  const frameId = bboxActive && stats?.frameId != null ? String(stats.frameId) : '—';
+  const bboxAge = bboxActive && Number.isFinite(stats?.heldBboxAgeMs) ? `${numeric(stats.heldBboxAgeMs)}ms` : bboxState;
+
+  if (compact) return <div className="tile-info" data-compact="true" role="group"
+    aria-label={`${number}번 타일 재생 정보 요약`} aria-live="off">
+    <div className="tile-info-line" aria-label="FPS 수신/디코딩/표시">
+      <span>FPS 수/디/표</span><b>{numeric(stats?.receiveFps)}/{numeric(stats?.decodeFps)}/{numeric(stats?.renderFps)}</b>
+    </div>
+    <div className="tile-info-line">
+      <span>디코드 <b>{numeric(stats?.decodeLatencyMs)}ms</b></span>
+      <span>큐/대기 <b>{numeric(stats?.decodeQueueSize)}/{numeric(stats?.pendingFrames)}</b></span>
+    </div>
+    <div className="tile-info-line" aria-label="영상과 마지막 BBox의 좌표 기준 시차, 늦은 BBox 수">
+      <span>영상−BBox <b>{bboxAge}</b></span><span>늦음 <b>{numeric(stats?.lateBbox)}</b></span>
+    </div>
+    <div className="tile-info-line tile-info-frame"><span>BBox ID</span><b>{frameId}</b></div>
+  </div>;
+
+  return <div className="tile-info" role="group" aria-label={`${number}번 타일 재생 정보`} aria-live="off">
+    <div className="tile-info-line">
+      <span>FPS 수신/디코드/표시</span>
+      <b>{numeric(stats?.receiveFps)}/{numeric(stats?.decodeFps)}/{numeric(stats?.renderFps)}</b>
+    </div>
+    <div className="tile-info-line tile-info-media">
+      <span>{stats?.width && stats?.height ? `${stats.width}×${stats.height}` : '—'}</span>
+      <span>{stats?.codec || '—'}</span>
+      <span>{bitrate}</span>
+    </div>
+    <div className="tile-info-line" title="디코드 소요는 패킷의 디코딩 제출부터 출력까지, 그리기 소요는 화면에 그리는 작업 시간입니다.">
+      <span>디코드 <b>{numeric(stats?.decodeLatencyMs, 1)} ms</b></span>
+      <span>그리기 <b>{numeric(stats?.renderDurationMs, 1)} ms</b></span>
+    </div>
+    <div className="tile-info-line">
+      <span>큐/대기/버림 <b>{numeric(stats?.decodeQueueSize)}/{numeric(stats?.pendingFrames)}/{numeric(stats?.droppedFrames)}</b></span>
+      <span>늦은 BBox <b>{numeric(stats?.lateBbox)}</b></span>
+    </div>
+    <div className="tile-info-line tile-info-pts">
+      <span>영상 PTS <b>{pts(stats?.lastPresentedPtsUs)}</b></span>
+      <span>BBox PTS <b>{bboxActive ? pts(stats?.appliedBboxPtsUs) : '—'}</b> <em>{bboxState}</em></span>
+    </div>
+    <div className="tile-info-line">
+      <span>영상−BBox <b>{bboxActive && Number.isFinite(stats?.heldBboxAgeMs) ? `${numeric(stats.heldBboxAgeMs, 1)} ms` : '—'}</b></span>
+      <span className="tile-info-note">좌표 기준 시차</span>
+    </div>
+    <div className="tile-info-line tile-info-frame">
+      <span>BBox frame ID</span><b>{frameId}</b>
+    </div>
+  </div>;
+}
 
 function drawBbox(canvas, frame, bbox, colors) {
   if (!bbox?.boxes.length) {
@@ -41,7 +116,7 @@ function drawBbox(canvas, frame, bbox, colors) {
   }
 }
 
-function Camera({ ref, number, visible, selected, onSelect, onCameraDrop, supported, hardwareAcceleration }) {
+function Camera({ ref, number, visible, selected, onSelect, onCameraDrop, supported, hardwareAcceleration, infoOverlay, compactInfo }) {
   const canvas = useRef(null);
   const overlay = useRef(null);
   const session = useRef(null);
@@ -146,7 +221,7 @@ function Camera({ ref, number, visible, selected, onSelect, onCameraDrop, suppor
     const current = {
       ws, camera: source, decoder: null, needsKey: true, config: null, hardwareAcceleration,
       bboxEnabled: initialBbox, bboxRevision: 0,
-      metrics: { receivedFrames: 0, decodedFrames: 0, hiddenFrames: 0, decodeLatencyMs: 0, renderDurationMs: 0 },
+      metrics: { receivedFrames: 0, receivedBytes: 0, decodedFrames: 0, hiddenFrames: 0, decodeLatencyMs: 0, renderDurationMs: 0 },
       decodeStarts: new Map(), overlayDirty: true, lastStatsAt: -Infinity,
     };
     session.current = current;
@@ -160,7 +235,10 @@ function Camera({ ref, number, visible, selected, onSelect, onCameraDrop, suppor
     }
     current.fail = fail;
     current.getStats = () => ({ ...current.metrics, ...current.playout.getStats(),
-      decodeQueueSize: current.decoder?.decodeQueueSize ?? 0 });
+      decodeQueueSize: current.decoder?.decodeQueueSize ?? 0,
+      width: current.videoWidth ?? null, height: current.videoHeight ?? null,
+      codec: current.config?.codec ?? null, bboxAvailable: Boolean(current.camera.bboxAvailable),
+      bboxEnabled: current.bboxEnabled });
     function updateStats() {
       const now = performance.now();
       if (now - current.lastStatsAt < 1000) return;
@@ -173,7 +251,7 @@ function Camera({ ref, number, visible, selected, onSelect, onCameraDrop, suppor
       background: style.getPropertyValue('--video').trim(),
     };
     current.playout = createFramePlayout((frame, bbox) => {
-      if (!valid() || !isVisible.current) return;
+      if (!valid() || !isVisible.current) return false;
       try {
         const renderStart = performance.now();
         const sizeChanged = target.width !== frame.displayWidth || target.height !== frame.displayHeight;
@@ -200,6 +278,7 @@ function Camera({ ref, number, visible, selected, onSelect, onCameraDrop, suppor
         }
       } catch (error) {
         fail(error.message);
+        return false;
       }
     });
     ws.onopen = () => {
@@ -268,6 +347,7 @@ function Camera({ ref, number, visible, selected, onSelect, onCameraDrop, suppor
         const header = new DataView(data);
         const key = header.getUint8(0) === 1;
         current.metrics.receivedFrames++;
+        current.metrics.receivedBytes += data.byteLength - 9;
         if (current.decoder.decodeQueueSize > 10) {
           current.playout.reset();
           current.decodeStarts.clear();
@@ -326,6 +406,8 @@ function Camera({ ref, number, visible, selected, onSelect, onCameraDrop, suppor
         <span className="tile-index">{channelNumber}</span><span className="tile-name">{channelName}</span>
       </span>}
     </button>
+    {infoOverlay && visible && playing && <PlaybackInfo session={session} number={number}
+      bboxAvailable={Boolean(camera?.bboxAvailable)} bboxEnabled={bboxEnabled} bboxError={bboxError} compact={compactInfo} />}
     {camera && <div className="tile-actions" role="group" aria-label={`${number}번 타일 설정`}>
       {camera.bboxAvailable && active && <button type="button" className="tile-bbox" aria-label={`bbox ${bboxEnabled ? 'ON' : 'OFF'}`}
         aria-pressed={bboxEnabled} title={bboxEnabled ? 'bbox 숨기기' : 'bbox 표시하기'}
@@ -519,6 +601,10 @@ function App() {
     try { return localStorage.getItem(accelerationStorageKey) !== 'off'; }
     catch { return true; }
   });
+  const [infoOverlay, setInfoOverlay] = useState(() => {
+    try { return localStorage.getItem(infoOverlayStorageKey) === 'on'; }
+    catch { return false; }
+  });
   const [selected, setSelected] = useState(1);
   const [supported, setSupported] = useState(false);
   const [supportError, setSupportError] = useState('');
@@ -591,6 +677,13 @@ function App() {
     catch { /* Keep the setting for this page if browser storage is unavailable. */ }
   }
 
+  function changeInfoOverlay() {
+    const enabled = !infoOverlay;
+    setInfoOverlay(enabled);
+    try { localStorage.setItem(infoOverlayStorageKey, enabled ? 'on' : 'off'); }
+    catch { /* Keep the setting for this page if browser storage is unavailable. */ }
+  }
+
   function playCameras(cameraIds, target) {
     if (!supported) return;
     const requested = new Set(cameraIds);
@@ -624,6 +717,11 @@ function App() {
             onChange={event => changeAcceleration(event.target.checked)} />
           <span className="switch-track" aria-hidden="true" />
         </label>
+        <button type="button" className="info-overlay-toggle" aria-pressed={infoOverlay}
+          title="재생 정보를 초당 한 번 표시합니다. 디코드는 패킷의 디코딩 제출부터 출력까지, 그리기는 화면에 그리는 소요 시간입니다. 영상−BBox는 마지막 탐지 결과의 좌표 기준 시차이며, 네트워크 전체 지연이 아닙니다."
+          onClick={changeInfoOverlay}>
+          <span className="info-icon" aria-hidden="true">i</span>정보 오버레이 <span>{infoOverlay ? 'ON' : 'OFF'}</span>
+        </button>
       </div>
     </header>
     {supportError && <p className="support-error" role="alert">{supportError}</p>}
@@ -643,13 +741,14 @@ function App() {
             </button>)}
           </div>
         </div>
-        <div className="wall" style={{ '--columns': Math.sqrt(layout) }}>
+        <div className="wall" style={{ '--columns': Math.sqrt(layout) }} data-info-overlay={infoOverlay}>
           {Array.from({ length: 16 }, (_, index) => {
             const number = index + 1;
             return <Camera key={number} ref={player => { players.current[number] = player; }} number={number}
               visible={number <= layout} selected={number === selected} onSelect={() => setSelected(number)}
               onCameraDrop={ids => playCameras(ids, number)} supported={supported}
-              hardwareAcceleration={accelerationEnabled ? 'no-preference' : 'prefer-software'} />;
+              hardwareAcceleration={accelerationEnabled ? 'no-preference' : 'prefer-software'} infoOverlay={infoOverlay}
+              compactInfo={layout >= 9} />;
           })}
         </div>
       </section>
