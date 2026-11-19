@@ -1,71 +1,12 @@
 import React, { useEffect, useImperativeHandle, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
+import { createFramePlayout } from './playout.js';
 import './style.css';
 
 const layouts = [4, 9, 16];
 const cameraDragType = 'application/x-rtsp-camera';
 const accelerationStorageKey = 'rtsp-live.hardwareAcceleration';
 const cameraTime = new Intl.DateTimeFormat('ko-KR', { hour: '2-digit', minute: '2-digit', hour12: false });
-const bboxPlayoutDelayMs = 100;
-const maxPendingFrames = 8;
-const maxPendingBoxes = 32;
-
-function createFramePlayout(render) {
-  const frames = [];
-  const boxes = new Map();
-  let timer;
-  let lastPresentedPts = -Infinity;
-
-  function present(frame) {
-    const pts = frame.timestamp;
-    const bbox = boxes.get(pts);
-    boxes.delete(pts);
-    lastPresentedPts = Math.max(lastPresentedPts, pts);
-    try {
-      render(frame, bbox);
-    } finally {
-      frame.close();
-    }
-  }
-
-  function schedule() {
-    if (timer !== undefined || frames.length === 0) return;
-    timer = setTimeout(() => {
-      timer = undefined;
-      const now = performance.now();
-      while (frames.length > 0 && frames[0].deadline <= now) {
-        present(frames.shift().frame);
-      }
-      schedule();
-    }, frames[0].deadline - performance.now());
-  }
-
-  return {
-    addFrame(frame, waitForBbox) {
-      if (!waitForBbox) {
-        present(frame);
-        return;
-      }
-      frames.push({ frame, deadline: performance.now() + bboxPlayoutDelayMs });
-      if (frames.length > maxPendingFrames) present(frames.shift().frame);
-      schedule();
-    },
-    addBbox(bbox) {
-      if (bbox.ptsUs <= lastPresentedPts) return;
-      boxes.set(bbox.ptsUs, bbox);
-      if (boxes.size > maxPendingBoxes) boxes.delete(boxes.keys().next().value);
-    },
-    reset(showLatestFrame = false) {
-      clearTimeout(timer);
-      timer = undefined;
-      boxes.clear();
-      lastPresentedPts = -Infinity;
-      const latest = showLatestFrame ? frames.pop() : undefined;
-      for (const { frame } of frames.splice(0)) frame.close();
-      if (latest) present(latest.frame);
-    },
-  };
-}
 
 function drawBbox(canvas, frame, bbox, colors) {
   if (!bbox?.boxes.length) {
@@ -104,6 +45,8 @@ function Camera({ ref, number, visible, selected, onSelect, onCameraDrop, suppor
   const canvas = useRef(null);
   const overlay = useRef(null);
   const session = useRef(null);
+  const isVisible = useRef(visible);
+  isVisible.current = visible;
   const [camera, setCamera] = useState(null);
   const [bboxEnabled, setBboxEnabled] = useState(false);
   const [bboxError, setBboxError] = useState('');
@@ -136,9 +79,18 @@ function Camera({ ref, number, visible, selected, onSelect, onCameraDrop, suppor
   }
   useEffect(() => () => stop(false), []);
 
+  useEffect(() => {
+    if (!visible && session.current) {
+      session.current.playout.reset();
+      drawBbox(overlay.current);
+      session.current.overlayDirty = true;
+    }
+  }, [visible]);
+
   function resetBbox(enabled = false) {
     overlay.current.width = 0;
     overlay.current.height = 0;
+    if (session.current) session.current.overlayDirty = true;
     setBboxEnabled(enabled);
     setBboxError('');
   }
@@ -162,7 +114,9 @@ function Camera({ ref, number, visible, selected, onSelect, onCameraDrop, suppor
     if (!current.decoder || !current.config) return;
     try {
       current.playout.reset();
+      current.decodeStarts.clear();
       drawBbox(overlay.current);
+      current.overlayDirty = true;
       current.decoder.reset();
       current.config = { ...current.config, hardwareAcceleration };
       current.decoder.configure(current.config);
@@ -174,7 +128,8 @@ function Camera({ ref, number, visible, selected, onSelect, onCameraDrop, suppor
     }
   }, [hardwareAcceleration]);
 
-  useImperativeHandle(ref, () => ({ play: connect, changeBbox }));
+  useImperativeHandle(ref, () => ({ play: connect, changeBbox,
+    getStats: () => session.current?.getStats() ?? null }));
 
   function connect(source, enableBbox) {
     stop(false);
@@ -191,6 +146,8 @@ function Camera({ ref, number, visible, selected, onSelect, onCameraDrop, suppor
     const current = {
       ws, camera: source, decoder: null, needsKey: true, config: null, hardwareAcceleration,
       bboxEnabled: initialBbox, bboxRevision: 0,
+      metrics: { receivedFrames: 0, decodedFrames: 0, hiddenFrames: 0, decodeLatencyMs: 0, renderDurationMs: 0 },
+      decodeStarts: new Map(), overlayDirty: true, lastStatsAt: -Infinity,
     };
     session.current = current;
     const valid = () => session.current === current;
@@ -202,15 +159,25 @@ function Camera({ ref, number, visible, selected, onSelect, onCameraDrop, suppor
       setStatus(message);
     }
     current.fail = fail;
+    current.getStats = () => ({ ...current.metrics, ...current.playout.getStats(),
+      decodeQueueSize: current.decoder?.decodeQueueSize ?? 0 });
+    function updateStats() {
+      const now = performance.now();
+      if (now - current.lastStatsAt < 1000) return;
+      current.lastStatsAt = now;
+      target.dataset.playbackStats = JSON.stringify(current.getStats());
+    }
     const style = getComputedStyle(target);
     const colors = {
       accent: style.getPropertyValue('--accent').trim(),
       background: style.getPropertyValue('--video').trim(),
     };
     current.playout = createFramePlayout((frame, bbox) => {
-      if (!valid()) return;
+      if (!valid() || !isVisible.current) return;
       try {
-        if (target.width !== frame.displayWidth || target.height !== frame.displayHeight) {
+        const renderStart = performance.now();
+        const sizeChanged = target.width !== frame.displayWidth || target.height !== frame.displayHeight;
+        if (sizeChanged) {
           target.width = frame.displayWidth;
           target.height = frame.displayHeight;
         }
@@ -220,7 +187,13 @@ function Camera({ ref, number, visible, selected, onSelect, onCameraDrop, suppor
           setVideoSize({ width: frame.displayWidth, height: frame.displayHeight });
         }
         target.getContext('2d').drawImage(frame, 0, 0);
-        drawBbox(overlay.current, frame, bbox, colors);
+        if (current.overlayDirty || sizeChanged || current.lastDrawnBbox !== bbox) {
+          drawBbox(overlay.current, frame, bbox, colors);
+          current.lastDrawnBbox = bbox;
+          current.overlayDirty = false;
+        }
+        current.metrics.renderDurationMs = performance.now() - renderStart;
+        updateStats();
         if (current.waitingForFrame) {
           current.waitingForFrame = false;
           setStatus('');
@@ -262,16 +235,27 @@ function Camera({ ref, number, visible, selected, onSelect, onCameraDrop, suppor
           if (message.type === 'config') {
             if (current.decoder) {
               current.playout.reset();
+              current.decodeStarts.clear();
               drawBbox(overlay.current);
+              current.overlayDirty = true;
               if (current.decoder.state !== 'closed') current.decoder.close();
             }
-            current.config = { codec: message.codec, hardwareAcceleration: current.hardwareAcceleration };
+            current.config = { codec: message.codec, hardwareAcceleration: current.hardwareAcceleration, optimizeForLatency: true };
             current.needsKey = true;
             current.waitingForFrame = true;
             current.decoder = new VideoDecoder({
               output(frame) {
-                if (valid()) current.playout.addFrame(frame, current.bboxEnabled);
-                else frame.close();
+                if (!valid()) { frame.close(); return; }
+                current.metrics.decodedFrames++;
+                const startedAt = current.decodeStarts.get(frame.timestamp);
+                current.decodeStarts.delete(frame.timestamp);
+                if (startedAt !== undefined) current.metrics.decodeLatencyMs = performance.now() - startedAt;
+                if (isVisible.current) current.playout.addFrame(frame, current.bboxEnabled);
+                else {
+                  current.metrics.hiddenFrames++;
+                  frame.close();
+                  updateStats();
+                }
               },
               error: () => fail('영상 디코딩 오류가 발생했습니다. 다시 연결하세요.'),
             });
@@ -283,17 +267,23 @@ function Camera({ ref, number, visible, selected, onSelect, onCameraDrop, suppor
         if (data.byteLength <= 9 || !current.decoder) throw new Error('잘못된 영상 패킷입니다.');
         const header = new DataView(data);
         const key = header.getUint8(0) === 1;
+        current.metrics.receivedFrames++;
         if (current.decoder.decodeQueueSize > 10) {
           current.playout.reset();
+          current.decodeStarts.clear();
           drawBbox(overlay.current);
+          current.overlayDirty = true;
           current.decoder.reset();
           current.decoder.configure(current.config);
           current.needsKey = true;
         }
         if (current.needsKey && !key) return;
         current.needsKey = false;
+        const timestamp = Number(header.getBigInt64(1));
+        current.decodeStarts.set(timestamp, performance.now());
+        if (current.decodeStarts.size > 32) current.decodeStarts.delete(current.decodeStarts.keys().next().value);
         current.decoder.decode(new EncodedVideoChunk({
-          type: key ? 'key' : 'delta', timestamp: Number(header.getBigInt64(1)), data: new Uint8Array(data, 9),
+          type: key ? 'key' : 'delta', timestamp, data: new Uint8Array(data, 9),
         }));
       } catch (error) { fail(error.message); }
     };

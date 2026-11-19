@@ -19,6 +19,7 @@ from backend.shm_frames import shm_frame_signature
 router = APIRouter()
 MAX_METADATA = 1024 * 1024
 MAX_PAYLOAD = 8 * 1024 * 1024
+bbox_sources = {}
 
 # A short lease expires even when the server exits unexpectedly. Refresh only
 # keys owned by WebCodecs, and never change an existing external value.
@@ -75,7 +76,8 @@ async def receive_frames(reader, send_bbox, stream_id, width, height, *, synchro
                 'type': 'bbox', 'width': width, 'height': height,
                 'boxes': boxes_for(meta.get('detection_result')),
             }
-            if synchronize:
+            should_synchronize = synchronize() if callable(synchronize) else synchronize
+            if should_synchronize:
                 signature = await asyncio.to_thread(shm_frame_signature, meta)
                 if signature is not None:
                     message['frameSignature'] = signature
@@ -90,7 +92,7 @@ async def refresh_lease(redis, stream_id):
         await asyncio.sleep(2)
 
 
-async def _subscribe_bbox(camera_id, send_bbox, *, synchronize=False):
+async def _run_bbox_source(stream_id, send_bbox, *, synchronize=False):
     socket_path = os.getenv('SELECTIVE_BBOX_SOCKET')
     if not socket_path:
         raise ValueError('bbox 브로커 주소가 설정되지 않았습니다.')
@@ -99,9 +101,6 @@ async def _subscribe_bbox(camera_id, send_bbox, *, synchronize=False):
         raise ValueError('현재 환경에서 bbox 브로커 소켓을 사용할 수 없습니다.')
     writer = None
     try:
-        stream_id = await asyncio.to_thread(selective_stream_id, camera_id)
-        if not stream_id:
-            raise ValueError('선별관제 카메라에서 bbox를 켤 수 있습니다.')
         config = await asyncio.to_thread(read_config)
         if not isinstance(config, dict):
             raise ValueError('선별관제 설정이 올바르지 않습니다.')
@@ -137,6 +136,108 @@ async def _subscribe_bbox(camera_id, send_bbox, *, synchronize=False):
             writer.close()
             with suppress(OSError):
                 await writer.wait_closed()
+
+
+class BBoxSubscriber:
+    def __init__(self, synchronize):
+        self.synchronize = synchronize
+        self.messages = asyncio.Queue(maxsize=1)
+
+
+class BBoxFailure:
+    def __init__(self, error):
+        self.error = error
+
+
+class SharedBBoxSource:
+    def __init__(self, stream_id):
+        self.stream_id = stream_id
+        self.subscribers = set()
+        self.stopping = asyncio.Event()
+        self.updates = 0
+        self.signature_matches = 0
+        self.coalesced = 0
+        self.task = asyncio.create_task(self.run())
+
+    def needs_signature(self):
+        return any(subscriber.synchronize for subscriber in self.subscribers)
+
+    async def publish(self, message):
+        if isinstance(message, dict):
+            self.updates += 1
+            self.signature_matches += int('frameSignature' in message)
+        for subscriber in self.subscribers:
+            if subscriber.messages.full():
+                subscriber.messages.get_nowait()
+                self.coalesced += 1
+            subscriber.messages.put_nowait(message)
+
+    def remove(self, subscriber):
+        self.subscribers.discard(subscriber)
+        if not self.subscribers:
+            self.stopping.set()
+
+    async def run(self):
+        error = OSError('BBox source stopped')
+        producer = asyncio.create_task(_run_bbox_source(
+            self.stream_id, self.publish, synchronize=self.needs_signature,
+        ))
+        stop = asyncio.create_task(self.stopping.wait())
+        tasks = [producer, stop]
+        try:
+            done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            if producer in done and not producer.cancelled():
+                producer.result()
+        except Exception as failure:
+            error = failure if isinstance(failure, (OSError, ValueError, RedisError)) else OSError('BBox source failed')
+        finally:
+            self.stopping.set()
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            await self.publish(BBoxFailure(error))
+            if bbox_sources.get(self.stream_id) is self:
+                del bbox_sources[self.stream_id]
+
+
+async def _subscribe_bbox(camera_id, send_bbox, *, synchronize=False):
+    stream_id = await asyncio.to_thread(selective_stream_id, camera_id)
+    if not stream_id:
+        raise ValueError('선별관제 카메라에서 bbox를 켤 수 있습니다.')
+    while True:
+        source = bbox_sources.get(stream_id)
+        if source is None:
+            source = bbox_sources[stream_id] = SharedBBoxSource(stream_id)
+        if not source.stopping.is_set():
+            break
+        await asyncio.shield(source.task)
+
+    subscriber = BBoxSubscriber(synchronize)
+    source.subscribers.add(subscriber)
+    try:
+        while True:
+            message = await subscriber.messages.get()
+            if isinstance(message, BBoxFailure):
+                raise message.error
+            if not synchronize:
+                message = {key: value for key, value in message.items()
+                           if key not in ('frameSignature', 'frameId')}
+            await send_bbox(message)
+    finally:
+        source.remove(subscriber)
+        if source.stopping.is_set():
+            await asyncio.shield(source.task)
+
+
+def bbox_source_stats():
+    sources = tuple(bbox_sources.values())
+    return {
+        'sources': len(sources),
+        'subscribers': sum(len(source.subscribers) for source in sources),
+        'updates': sum(source.updates for source in sources),
+        'matchedFrames': sum(source.signature_matches for source in sources),
+        'coalescedUpdates': sum(source.coalesced for source in sources),
+    }
 
 
 async def subscribe_bbox(camera_id, on_bbox, *, synchronize=False):

@@ -10,7 +10,8 @@ from urllib.request import urlopen
 import uvicorn
 from websockets.asyncio.client import connect
 from websockets.exceptions import InvalidStatus
-from backend.app import MAX_PENDING_MESSAGES, SharedRelay, app, read_frame, relays, worker_request
+from backend.app import MAX_PENDING_MESSAGES, MAX_QUEUE_SECONDS, SharedRelay, Viewer, app, read_frame, relays, worker_request
+from backend import bbox as bbox_source
 from backend.nal import H264Relay, START, annexb_nals
 from backend.shm_frames import vcl_fingerprint
 
@@ -57,6 +58,130 @@ class PacketTests(unittest.IsolatedAsyncioTestCase):
 
 
 class RelayTests(unittest.IsolatedAsyncioTestCase):
+    async def test_bbox_is_sent_while_video_queue_stays_busy(self):
+        viewer = Viewer()
+        packet = struct.pack('>Bq', 1, 0) + START + b'\x65key'
+        bbox = {'type': 'bbox', 'ptsUs': 0, 'boxes': []}
+        received = asyncio.Event()
+        videos_sent = 0
+        metadata = []
+
+        class BusySocket:
+            async def send_bytes(self, data):
+                nonlocal videos_sent
+                videos_sent += 1
+                viewer.enqueue(packet)
+                await asyncio.sleep(0)
+
+            async def send_json(self, message):
+                metadata.append(message)
+                received.set()
+
+        viewer.enqueue(packet)
+        viewer.enqueue_bbox(bbox)
+        sender = asyncio.create_task(viewer.send_to(BusySocket()))
+        try:
+            await asyncio.wait_for(received.wait(), 1)
+            self.assertIn(bbox, metadata)
+            self.assertLessEqual(videos_sent, 8, 'Metadata should not starve behind ongoing video')
+        finally:
+            sender.cancel()
+            await asyncio.gather(sender, return_exceptions=True)
+
+    async def test_queue_age_resyncs_without_waiting_for_count_limit(self):
+        source = 'rtsp://camera/age-test'
+        config = {'type': 'config', 'codec': 'avc1.42e01e'}
+        first_key = struct.pack('>Bq', 1, 0) + START + b'\x65first'
+        delta = struct.pack('>Bq', 0, 1) + START + b'\x41delta'
+        next_key = struct.pack('>Bq', 1, 2) + START + b'\x65next'
+        clock = [1.0]
+
+        with patch('backend.app.monotonic', side_effect=lambda: clock[0]):
+            with patch.object(SharedRelay, 'run'):
+                relay = SharedRelay(source, worker_request(source))
+                await relay.task
+            relay.config = config
+            slow_viewer = relay.add_viewer()
+            fast_viewer = relay.add_viewer()
+            self.assertEqual(slow_viewer.messages.get_nowait(), config)
+            self.assertEqual(fast_viewer.messages.get_nowait(), config)
+            relay.publish(first_key)
+            self.assertEqual(fast_viewer.messages.get_nowait(), first_key)
+
+            clock[0] += MAX_QUEUE_SECONDS + .01
+            relay.publish(delta)
+            self.assertEqual(fast_viewer.messages.get_nowait(), delta)
+            self.assertEqual(slow_viewer.messages.get_nowait(), config)
+            self.assertTrue(slow_viewer.messages.empty())
+            self.assertTrue(slow_viewer.needs_key)
+            self.assertIn(slow_viewer, relay.viewers)
+
+            relay.publish(next_key)
+            self.assertEqual(slow_viewer.messages.get_nowait(), next_key)
+            self.assertEqual(fast_viewer.messages.get_nowait(), next_key)
+
+    async def test_sender_discards_expired_frames_before_writing_socket(self):
+        source = 'rtsp://camera/sender-age-test'
+        config = {'type': 'config', 'codec': 'avc1.42e01e'}
+        old_key = struct.pack('>Bq', 1, 0) + START + b'\x65old'
+        next_key = struct.pack('>Bq', 1, 2) + START + b'\x65next'
+        config_sent = asyncio.Event()
+        frame_sent = asyncio.Event()
+        sent = []
+        clock = [1.0]
+
+        class Socket:
+            async def send_json(self, message):
+                sent.append(message)
+                config_sent.set()
+
+            async def send_bytes(self, message):
+                sent.append(message)
+                frame_sent.set()
+
+        with patch('backend.app.monotonic', side_effect=lambda: clock[0]):
+            with patch.object(SharedRelay, 'run'):
+                relay = SharedRelay(source, worker_request(source))
+                await relay.task
+            relay.config = config
+            viewer = relay.add_viewer()
+            self.assertEqual(viewer.messages.get_nowait(), config)
+            relay.publish(old_key)
+            clock[0] += MAX_QUEUE_SECONDS + .01
+            sender = asyncio.create_task(viewer.send_to(Socket()))
+            try:
+                await asyncio.wait_for(config_sent.wait(), 1)
+                self.assertEqual(sent, [config])
+                self.assertTrue(viewer.needs_key)
+                relay.publish(next_key)
+                await asyncio.wait_for(frame_sent.wait(), 1)
+                self.assertEqual(sent, [config, next_key])
+            finally:
+                sender.cancel()
+                await asyncio.gather(sender, return_exceptions=True)
+
+    async def test_sender_preserves_terminal_error_when_queue_is_expired(self):
+        viewer = Viewer()
+        viewer.config = {'type': 'config', 'codec': 'avc1.42e01e'}
+        terminal_error = {'type': 'error', 'message': 'Source ended'}
+        clock = [1.0]
+        sent = []
+
+        class Socket:
+            async def send_json(self, message):
+                sent.append(message)
+
+            async def send_bytes(self, message):
+                sent.append(message)
+
+        with patch('backend.app.monotonic', side_effect=lambda: clock[0]):
+            viewer.enqueue(struct.pack('>Bq', 1, 0) + START + b'\x65old')
+            viewer.enqueue(terminal_error)
+            clock[0] += MAX_QUEUE_SECONDS + .01
+            await asyncio.wait_for(viewer.send_to(Socket()), 1)
+        self.assertEqual(sent, [terminal_error])
+        self.assertEqual(viewer.metrics['framesDropped'], 1)
+
     async def test_slow_viewer_resumes_from_keyframe_without_unsubscribing(self):
         source = 'rtsp://camera/live'
         config = {'type': 'config', 'codec': 'avc1.42e01e'}
@@ -101,6 +226,80 @@ class RelayTests(unittest.IsolatedAsyncioTestCase):
                 relay.publish(delta)
                 self.assertEqual(slow_viewer.messages.get_nowait(), delta)
                 self.assertEqual(fast_viewer.messages.get_nowait(), delta)
+
+
+class BBoxTests(unittest.IsolatedAsyncioTestCase):
+    async def test_same_stream_shares_bbox_source_until_last_subscriber_leaves(self):
+        stream_id = 'shared-camera-stream'
+        started = asyncio.Queue()
+        producers = []
+        callbacks = [asyncio.Queue(), asyncio.Queue(), asyncio.Queue()]
+        subscribers = []
+
+        async def produce(source_id, send_bbox, *, synchronize=False):
+            stopped = asyncio.Event()
+            producers.append(stopped)
+            started.put_nowait((source_id, send_bbox, synchronize))
+            try:
+                await asyncio.Future()
+            finally:
+                stopped.set()
+
+        async def wait_for_subscribers(count):
+            async def wait():
+                while True:
+                    source = bbox_source.bbox_sources.get(stream_id)
+                    if source is not None and len(source.subscribers) == count:
+                        return source
+                    await asyncio.sleep(.001)
+            return await asyncio.wait_for(wait(), 1)
+
+        with patch.object(bbox_source, 'selective_stream_id', return_value=stream_id):
+            with patch.object(bbox_source, '_run_bbox_source', side_effect=produce):
+                try:
+                    subscribers.append(asyncio.create_task(bbox_source.subscribe_bbox(
+                        7, callbacks[0].put_nowait, synchronize=True,
+                    )))
+                    source_id, publish, synchronize = await asyncio.wait_for(started.get(), 1)
+                    self.assertEqual(source_id, stream_id)
+                    subscribers.append(asyncio.create_task(bbox_source.subscribe_bbox(
+                        8, callbacks[1].put_nowait,
+                    )))
+                    source = await wait_for_subscribers(2)
+                    self.assertEqual(len(producers), 1)
+                    self.assertTrue(synchronize())
+
+                    message = {'type': 'bbox', 'boxes': [], 'frameSignature': 'signature', 'frameId': 19}
+                    await publish(message)
+                    self.assertEqual(await asyncio.wait_for(callbacks[0].get(), 1), message)
+                    self.assertEqual(await asyncio.wait_for(callbacks[1].get(), 1), {'type': 'bbox', 'boxes': []})
+
+                    subscribers[0].cancel()
+                    await asyncio.gather(subscribers[0], return_exceptions=True)
+                    self.assertIs(bbox_source.bbox_sources[stream_id], source)
+                    self.assertFalse(producers[0].is_set())
+                    self.assertFalse(synchronize())
+                    next_message = {'type': 'bbox', 'boxes': [{'left': 20}]}
+                    await publish(next_message)
+                    self.assertEqual(await asyncio.wait_for(callbacks[1].get(), 1), next_message)
+
+                    subscribers[1].cancel()
+                    await asyncio.gather(subscribers[1], return_exceptions=True)
+                    self.assertTrue(producers[0].is_set())
+                    self.assertNotIn(stream_id, bbox_source.bbox_sources)
+
+                    subscribers.append(asyncio.create_task(bbox_source.subscribe_bbox(
+                        9, callbacks[2].put_nowait,
+                    )))
+                    await asyncio.wait_for(started.get(), 1)
+                    replacement = await wait_for_subscribers(1)
+                    self.assertIsNot(replacement, source)
+                    self.assertEqual(len(producers), 2)
+                finally:
+                    for task in subscribers:
+                        task.cancel()
+                    await asyncio.gather(*subscribers, return_exceptions=True)
+        self.assertNotIn(stream_id, bbox_source.bbox_sources)
 
 
 class StreamTests(unittest.IsolatedAsyncioTestCase):
@@ -211,46 +410,52 @@ with socket.create_connection(('127.0.0.1', int(sys.argv[1]))) as control:
         next_key = struct.pack('>Bq', 1, 2) + START + b'\x65next'
 
         try:
-            async with control:
-                with (
-                    patch('backend.app.asyncio.create_subprocess_exec', start_worker),
-                    patch('backend.app.camera_url', return_value=source) as lookup,
-                ):
-                    async with connect(self.url) as first, connect(self.url) as second:
-                        await first.send(json.dumps({'url': source}))
-                        writer = await next_worker()
-                        writer.write(config_frame + framed(1, first_key))
-                        self.assertEqual(json.loads(await receive(first)), config)
-                        self.assertEqual(await receive(first), first_key)
+            with (
+                patch('backend.app.asyncio.create_subprocess_exec', start_worker),
+                patch('backend.app.camera_url', return_value=source) as lookup,
+            ):
+                async with connect(self.url) as first, connect(self.url) as second:
+                    await first.send(json.dumps({'url': source}))
+                    writer = await next_worker()
+                    writer.write(config_frame + framed(1, first_key))
+                    self.assertEqual(json.loads(await receive(first)), config)
+                    self.assertEqual(await receive(first), first_key)
 
-                        await second.send(json.dumps({'cameraId': 7}))
-                        self.assertEqual(json.loads(await receive(second)), config)
-                        lookup.assert_called_once_with(7)
-                        self.assertEqual(len(processes), 1)
+                    await second.send(json.dumps({'cameraId': 7}))
+                    self.assertEqual(json.loads(await receive(second)), config)
+                    lookup.assert_called_once_with(7)
+                    self.assertEqual(len(processes), 1)
 
-                        writer.write(framed(1, delta) + framed(1, next_key))
-                        self.assertEqual(await receive(first), delta)
-                        self.assertEqual(await receive(first), next_key)
-                        self.assertEqual(await receive(second), next_key)
+                    writer.write(framed(1, delta) + framed(1, next_key))
+                    self.assertEqual(await receive(first), delta)
+                    self.assertEqual(await receive(first), next_key)
+                    self.assertEqual(await receive(second), next_key)
 
-                        await first.close()
-                        writer.write(framed(1, delta))
-                        self.assertEqual(await receive(second), delta)
-                        self.assertIsNone(processes[0].returncode)
+                    await first.close()
+                    writer.write(framed(1, delta))
+                    self.assertEqual(await receive(second), delta)
+                    self.assertIsNone(processes[0].returncode)
 
-                    await asyncio.wait_for(processes[0].wait(), 5)
-                    async with connect(self.url) as reopened:
-                        await reopened.send(json.dumps({'url': source}))
-                        writer = await next_worker()
-                        writer.write(config_frame + framed(1, first_key))
-                        self.assertEqual(json.loads(await receive(reopened)), config)
-                        self.assertEqual(await receive(reopened), first_key)
-                    await asyncio.wait_for(processes[1].wait(), 5)
-                    self.assertEqual(requests, [{'url': source, 'demo': False}] * 2)
+                await asyncio.wait_for(processes[0].wait(), 5)
+                async with connect(self.url) as reopened:
+                    await reopened.send(json.dumps({'url': source}))
+                    writer = await next_worker()
+                    writer.write(config_frame + framed(1, first_key))
+                    self.assertEqual(json.loads(await receive(reopened)), config)
+                    self.assertEqual(await receive(reopened), first_key)
+                await asyncio.wait_for(processes[1].wait(), 5)
+                self.assertEqual(requests, [{'url': source, 'demo': False, 'fingerprints': True}] * 2)
         finally:
+            control.close()
             for writer in writers:
                 writer.close()
-            await asyncio.gather(*(writer.wait_closed() for writer in writers), return_exceptions=True)
+            try:
+                await asyncio.wait_for(asyncio.gather(
+                    *(writer.wait_closed() for writer in writers), return_exceptions=True,
+                ), 5)
+            finally:
+                # Server.wait_closed() also waits for accepted transports on Linux.
+                await asyncio.wait_for(control.wait_closed(), 5)
 
     async def test_stream_keeps_playing_while_bbox_is_delayed_disabled_or_failing(self):
         source = 'rtsp://camera/bbox-test'

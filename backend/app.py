@@ -5,6 +5,7 @@ from contextlib import asynccontextmanager, suppress
 import json
 import os
 from pathlib import Path
+from time import monotonic
 import shutil
 import signal
 import sqlite3
@@ -18,7 +19,7 @@ from fastapi.staticfiles import StaticFiles
 from redis.exceptions import RedisError
 
 from backend.cameras import camera_url, router as cameras_router
-from backend.bbox import router as bbox_router, subscribe_bbox
+from backend.bbox import router as bbox_router, subscribe_bbox, bbox_source_stats
 from backend.frame_sync import FrameMatcher
 from backend.selective import start_monitor
 from backend.shm_frames import vcl_fingerprint
@@ -43,6 +44,9 @@ app.include_router(cameras_router)
 app.include_router(bbox_router)
 MAX_FRAME_BYTES = 8 * 1024 * 1024
 MAX_PENDING_MESSAGES = 16
+MAX_QUEUE_SECONDS = .15
+MAX_PENDING_BYTES = 8 * 1024 * 1024
+VIDEO_BURST = 4
 STREAM_ERROR = '영상을 받을 수 없습니다. RTSP 주소, 인증, H.264 설정 및 네트워크 연결을 확인하세요.'
 relays = {}
 
@@ -63,13 +67,44 @@ async def read_frame(reader):
     return await asyncio.wait_for(reader.readexactly(size), 15)
 
 
+class StreamQueue(asyncio.Queue):
+    def __init__(self):
+        super().__init__()
+        self.timestamps = deque()
+        self.pending_bytes = 0
+
+    @property
+    def age_seconds(self):
+        return monotonic() - self.timestamps[0] if self.timestamps else 0
+
+    @property
+    def has_control(self):
+        return any(isinstance(message, dict) for message in self._queue)
+
+    def _put(self, message):
+        super()._put(message)
+        self.timestamps.append(monotonic())
+        if isinstance(message, bytes):
+            self.pending_bytes += len(message)
+
+    def _get(self):
+        message = super()._get()
+        self.timestamps.popleft()
+        if isinstance(message, bytes):
+            self.pending_bytes -= len(message)
+        return message
+
+
 class Viewer:
     def __init__(self):
-        self.messages = asyncio.Queue()
+        self.messages = StreamQueue()
         self.needs_key = True
+        self.config = None
         self.bbox_messages = deque(maxlen=MAX_PENDING_MESSAGES)
         self.matcher = None
         self.ready = asyncio.Event()
+        self.metrics = {'videoSent': 0, 'bboxSent': 0, 'resyncs': 0, 'framesDropped': 0,
+                        'queueWaitMs': 0, 'maxQueueWaitMs': 0}
 
     def enqueue(self, message):
         self.messages.put_nowait(message)
@@ -87,20 +122,48 @@ class Viewer:
         self.bbox_messages.append(message)
         self.ready.set()
 
+    def resync(self):
+        error = None
+        while not self.messages.empty():
+            message = self.messages.get_nowait()
+            if isinstance(message, bytes):
+                self.metrics['framesDropped'] += 1
+            elif message.get('type') == 'error':
+                error = message
+        self.reset_bbox(keep_error=True)
+        self.needs_key = True
+        self.metrics['resyncs'] += 1
+        if error is not None:
+            self.enqueue(error)
+        elif self.config is not None:
+            self.enqueue(self.config)
+
     async def send_to(self, ws):
+        video_burst = 0
         while True:
-            if not self.messages.empty():
-                message = self.messages.get_nowait()
-            elif self.bbox_messages:
+            if self.messages.age_seconds > MAX_QUEUE_SECONDS:
+                self.resync()
+            if (self.bbox_messages and not self.messages.has_control
+                    and (video_burst >= VIDEO_BURST or self.messages.empty())):
                 message = self.bbox_messages.popleft()
+                video_burst = 0
+            elif not self.messages.empty():
+                queue_wait_ms = self.messages.age_seconds * 1000
+                self.metrics['queueWaitMs'] = round(queue_wait_ms, 2)
+                self.metrics['maxQueueWaitMs'] = max(self.metrics['maxQueueWaitMs'], round(queue_wait_ms, 2))
+                message = self.messages.get_nowait()
+                video_burst += 1
             else:
                 self.ready.clear()
                 await self.ready.wait()
                 continue
             if isinstance(message, bytes):
                 await asyncio.wait_for(ws.send_bytes(message), 5)
+                self.metrics['videoSent'] += 1
             else:
                 await asyncio.wait_for(ws.send_json(message), 5)
+                if message['type'] == 'bbox':
+                    self.metrics['bboxSent'] += 1
                 if message['type'] == 'error':
                     return
 
@@ -118,6 +181,7 @@ class SharedRelay:
         viewer = Viewer()
         self.viewers.add(viewer)
         if self.config is not None:
+            viewer.config = self.config
             viewer.enqueue(self.config)
         return viewer
 
@@ -126,28 +190,27 @@ class SharedRelay:
         if not self.viewers:
             self.stopping.set()
 
-    def publish(self, message):
+    def publish(self, message, signature=None):
         video = isinstance(message, bytes)
         viewers = tuple(self.viewers)
-        signature = None
-        if video and len(message) > 9 and any(viewer.matcher is not None for viewer in viewers):
+        if signature is None and video and len(message) > 9 and any(viewer.matcher is not None for viewer in viewers):
             signature = vcl_fingerprint(message[9:])
         for viewer in viewers:
-            if viewer.messages.qsize() >= MAX_PENDING_MESSAGES:
+            if (viewer.messages.qsize() >= MAX_PENDING_MESSAGES
+                    or viewer.messages.age_seconds > MAX_QUEUE_SECONDS
+                    or video and viewer.messages.pending_bytes + len(message) > MAX_PENDING_BYTES):
                 # Discard stale frames and reset this viewer's decoder before resuming.
-                while not viewer.messages.empty():
-                    viewer.messages.get_nowait()
-                viewer.reset_bbox(keep_error=True)
-                viewer.needs_key = True
-                if video and self.config is not None:
-                    viewer.enqueue(self.config)
+                viewer.resync()
             if video:
                 if viewer.needs_key and message[0] != 1:
+                    viewer.metrics['framesDropped'] += 1
                     continue
                 viewer.needs_key = False
             else:
                 viewer.needs_key = True
                 viewer.reset_bbox(keep_error=True)
+                if message.get('type') == 'config':
+                    viewer.config = message
             viewer.enqueue(message)
             if signature is not None and viewer.matcher is not None:
                 matched = viewer.matcher.add_frame(signature, struct.unpack_from('>q', message, 1)[0])
@@ -166,6 +229,8 @@ class SharedRelay:
             elif message[0] == 1:
                 # All viewers receive the same original NAL bytes and PTS.
                 self.publish(message[1:])
+            elif message[0] == 2 and len(message) > 42:
+                self.publish(message[33:], signature=message[1:33])
             else:
                 raise ValueError('잘못된 메시지 종류')
 
@@ -182,7 +247,7 @@ class SharedRelay:
                 # The worker's stderr can contain camera credentials.
                 stderr=asyncio.subprocess.DEVNULL,
             )
-            process.stdin.write((json.dumps(self.request) + '\n').encode())
+            process.stdin.write((json.dumps({**self.request, 'fingerprints': True}) + '\n').encode())
             await process.stdin.drain()
             if os.name != 'nt' or not self.request['demo']:
                 process.stdin.close()
@@ -312,6 +377,22 @@ async def receive_controls(ws, viewer, camera_id, request):
 @app.get('/api/health')
 async def health():
     return {'status': 'ok', 'ffmpeg': shutil.which('ffmpeg') is not None}
+
+
+@app.get('/api/metrics')
+async def metrics():
+    viewers = [viewer for relay in relays.values() for viewer in relay.viewers]
+    return {
+        'activeSources': len(relays),
+        'activeViewers': len(viewers),
+        'bbox': bbox_source_stats(),
+        'viewers': [{**viewer.metrics,
+                     'queueFrames': viewer.messages.qsize(),
+                     'queueBytes': viewer.messages.pending_bytes,
+                     'oldestQueueMs': round(viewer.messages.age_seconds * 1000, 2),
+                     'pendingBbox': len(viewer.bbox_messages)}
+                    for viewer in viewers],
+    }
 
 
 @app.websocket('/ws/stream')

@@ -11,6 +11,7 @@ from threading import Event, Thread
 import av
 
 from backend.nal import H264Relay
+from backend.shm_frames import vcl_fingerprint
 
 
 def emit(kind, body):
@@ -73,7 +74,11 @@ def main():
                 if packet.pts is None or packet.time_base is None:
                     raise ValueError('영상 프레임에 PTS가 없습니다.')
                 timestamp = int(packet.pts * packet.time_base * 1_000_000)
-                emit(1, struct.pack('>Bq', int(key), timestamp) + data)
+                frame = struct.pack('>Bq', int(key), timestamp) + data
+                if request.get('fingerprints'):
+                    emit(2, vcl_fingerprint(data) + frame)
+                else:
+                    emit(1, frame)
     except Exception:
         if not stopping.is_set():
             raise

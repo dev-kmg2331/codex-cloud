@@ -1,0 +1,20 @@
+[Unit]
+Description=WebCodecs camera relay
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=omeye
+Group=omeye
+WorkingDirectory=/home/omeye/webcodecs
+EnvironmentFile=/home/omeye/webcodecs/.env
+ExecStart=/home/omeye/webcodecs/.venv/bin/python -m uvicorn backend.app:app --host 127.0.0.1 --port 3001 --workers 1
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=10
+KillMode=control-group
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
