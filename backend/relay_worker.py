@@ -1,9 +1,12 @@
 """Isolated blocking RTSP demuxer. stdout is framed JSON / Annex B access units."""
 import json
+import os
 import signal
 import struct
 import subprocess
 import sys
+from contextlib import suppress
+from threading import Event, Thread
 
 import av
 
@@ -19,6 +22,7 @@ def emit(kind, body):
 def main():
     request = json.loads(sys.stdin.readline())
     demo = None
+    stopping = Event()
     try:
         if request.get('demo'):
             # Synthetic source only. Real RTSP input never passes through an encoder.
@@ -29,6 +33,15 @@ def main():
                 '-pix_fmt', 'yuv420p', '-profile:v', 'baseline', '-g', '25',
                 '-f', 'mpegts', '-flush_packets', '1', 'pipe:1',
             ], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            if os.name == 'nt':
+                # The parent closes stdin so FFmpeg stops before the worker exits.
+                def stop_demo_on_eof():
+                    os.read(sys.stdin.fileno(), 1)
+                    stopping.set()
+                    with suppress(ProcessLookupError):
+                        demo.terminate()
+
+                Thread(target=stop_demo_on_eof, daemon=True).start()
             source = av.open(demo.stdout, format='mpegts')
         else:
             source = av.open(request['url'], options={'rtsp_transport': 'tcp'}, timeout=(10, 10))
@@ -40,6 +53,8 @@ def main():
             codec = None
             waiting_key = True
             for packet in source.demux(video):
+                if stopping.is_set():
+                    return
                 if not packet.size:
                     continue
                 au = relay.access_unit(bytes(packet))
@@ -59,6 +74,9 @@ def main():
                     raise ValueError('영상 프레임에 PTS가 없습니다.')
                 timestamp = int(packet.pts * packet.time_base * 1_000_000)
                 emit(1, struct.pack('>Bq', int(key), timestamp) + data)
+    except Exception:
+        if not stopping.is_set():
+            raise
     finally:
         if demo:
             if demo.stdout:
