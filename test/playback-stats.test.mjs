@@ -136,3 +136,124 @@ test('respects a custom sampling interval', () => {
     receiveFps: 20, renderFps: 16, bitrateBps: 16_000, sampleDurationMs: 250,
   });
 });
+
+function diagnostics(rendered = 0, dropped = 0, bboxReceived = 0, lateBbox = 0) {
+  return { ...stats(rendered + dropped, rendered, (rendered + dropped) * 1000),
+    decodedFrames: rendered + dropped, droppedFrames: dropped, bboxReceived, lateBbox };
+}
+
+function recentRates(sample) {
+  assert.ok(sample);
+  return { dropRatePercent: sample.dropRatePercent, lateBboxRatePercent: sample.lateBboxRatePercent,
+    droppedFps: sample.droppedFps, recentWindowMs: sample.recentWindowMs };
+}
+
+const zeroRecent = { dropRatePercent: 0, lateBboxRatePercent: 0, droppedFps: 0, recentWindowMs: 0 };
+
+test('recent percentages use counter changes rather than lifetime totals', () => {
+  const sampler = createPlaybackSampler();
+  assert.deepEqual(recentRates(sampler.sample(diagnostics(1000, 500, 100, 80), 0)), zeroRecent);
+  assert.deepEqual(recentRates(sampler.sample(diagnostics(1090, 510, 105, 81), 1000)), {
+    dropRatePercent: 10, lateBboxRatePercent: 20, droppedFps: 10, recentWindowMs: 1000,
+  });
+});
+
+test('an old loss burst leaves the rolling window while lifetime counters stay unchanged', () => {
+  const sampler = createPlaybackSampler();
+  sampler.sample(diagnostics(), 0);
+  sampler.sample(diagnostics(80, 20, 10, 2), 1000);
+  const second = sampler.sample(diagnostics(180, 20, 20, 2), 2000);
+  assert.equal(second.renderFps, 100, 'FPS still uses the most recent one-second interval');
+  assert.deepEqual(recentRates(second), {
+    dropRatePercent: 10, lateBboxRatePercent: 10, droppedFps: 10, recentWindowMs: 2000,
+  });
+  for (let second = 3; second <= 5; second++) {
+    sampler.sample(diagnostics(second * 100 - 20, 20, second * 10, 2), second * 1000);
+  }
+  const recovered = sampler.sample(diagnostics(580, 20, 60, 2), 6000);
+  assert.deepEqual(recentRates(recovered), { ...zeroRecent, recentWindowMs: 5000 });
+  assert.equal(recovered.droppedFrames, 20);
+  assert.equal(recovered.lateBbox, 2);
+});
+
+test('reports the actual rolling window and ignores calls before the sampling interval', () => {
+  const sampler = createPlaybackSampler();
+  sampler.sample(diagnostics(), 0);
+  sampler.sample(diagnostics(90, 10, 5, 1), 1100);
+  assert.equal(sampler.sample(diagnostics(90, 10, 5, 1), 1200), null);
+  for (let step = 2; step <= 5; step++) {
+    sampler.sample(diagnostics(step * 90, step * 10, step * 5, step), step * 1000 + 100);
+  }
+  const recent = sampler.sample(diagnostics(540, 60, 30, 6), 6200);
+  assert.equal(recent.recentWindowMs, 5100);
+  assert.equal(recent.dropRatePercent, 10);
+  assert.equal(recent.lateBboxRatePercent, 20);
+  assert.ok(Math.abs(recent.droppedFps - 50_000 / 5100) < 1e-9);
+});
+
+test('idle or legacy snapshots with no BBox counter have finite zero denominators', () => {
+  const sampler = createPlaybackSampler();
+  sampler.sample(stats(), 0);
+  assert.deepEqual(recentRates(sampler.sample(stats(), 1000)), { ...zeroRecent, recentWindowMs: 1000 });
+  const legacy = sampler.sample({ ...stats(25, 20, 2000), droppedFrames: 5, lateBbox: 3 }, 2000);
+  assert.equal(legacy.dropRatePercent, 20);
+  assert.equal(legacy.lateBboxRatePercent, 0);
+  assert.equal(legacy.droppedFps, 2.5);
+  assert.equal(legacy.recentWindowMs, 2000);
+});
+
+test('a rewind in loss or BBox counters clears the recent window as well as FPS baselines', () => {
+  for (const key of ['droppedFrames', 'bboxReceived', 'lateBbox']) {
+    const sampler = createPlaybackSampler();
+    sampler.sample(diagnostics(100, 20, 10, 3), 0);
+    sampler.sample(diagnostics(120, 25, 12, 4), 1000);
+    const rewound = { ...diagnostics(150, 30, 15, 5), [key]: 0 };
+    const rebased = sampler.sample(rewound, 2000);
+    assert.deepEqual(recentRates(rebased), zeroRecent);
+    assert.deepEqual(rates(rebased), zeroRates);
+    const next = { ...rewound, receivedFrames: rewound.receivedFrames + 20,
+      decodedFrames: rewound.decodedFrames + 20, renderedFrames: rewound.renderedFrames + 18,
+      receivedBytes: rewound.receivedBytes + 5000, droppedFrames: rewound.droppedFrames + 2,
+      bboxReceived: rewound.bboxReceived + 5, lateBbox: rewound.lateBbox + 1 };
+    assert.deepEqual(recentRates(sampler.sample(next, 3000)), {
+      dropRatePercent: 10, lateBboxRatePercent: 20, droppedFps: 2, recentWindowMs: 1000,
+    });
+  }
+});
+
+test('explicit resets, invalid clocks and long gaps discard stale recent loss history', () => {
+  for (const reset of ['explicit', 'clock', 'gap']) {
+    const sampler = createPlaybackSampler();
+    sampler.sample(diagnostics(), 0);
+    sampler.sample(diagnostics(80, 20, 10, 2), 1000);
+    if (reset === 'explicit') sampler.reset();
+    if (reset === 'clock') assert.deepEqual(recentRates(sampler.sample(diagnostics(), NaN)), zeroRecent);
+    assert.deepEqual(recentRates(sampler.sample(diagnostics(100, 30, 15, 5), 8000)), zeroRecent);
+    assert.deepEqual(recentRates(sampler.sample(diagnostics(120, 30, 20, 5), 9000)),
+      { ...zeroRecent, recentWindowMs: 1000 });
+  }
+});
+
+test('passes through loss reasons without mutating the input snapshot or nested object', () => {
+  const reasons = Object.freeze({ coalesced: 3, expired: 2, overflow: 1, reset: 5, renderSkipped: 0 });
+  const snapshot = Object.freeze({ ...diagnostics(89, 11, 10, 2), droppedFrameReasons: reasons });
+  const sampler = createPlaybackSampler();
+  sampler.sample(diagnostics(), 0);
+  const result = sampler.sample(snapshot, 1000);
+  assert.notEqual(result, snapshot);
+  assert.equal(result.droppedFrameReasons, reasons);
+  assert.deepEqual(snapshot, { ...diagnostics(89, 11, 10, 2), droppedFrameReasons: reasons });
+});
+
+test('keeps the recent sample history bounded even with very short custom intervals', () => {
+  const sampler = createPlaybackSampler({ intervalMs: 1 });
+  sampler.sample(diagnostics(), 0);
+  let latest;
+  for (let step = 1; step <= 200; step++) {
+    latest = sampler.sample(diagnostics(step * 9, step, step * 5, step), step);
+  }
+  assert.ok(latest.recentWindowMs > 0 && latest.recentWindowMs <= 32);
+  assert.equal(latest.dropRatePercent, 10);
+  assert.equal(latest.lateBboxRatePercent, 20);
+  assert.equal(latest.droppedFps, 1000);
+});

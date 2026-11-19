@@ -458,6 +458,8 @@ main {
   pointer-events: none;
 }
 .tile-info-line { display: flex; flex-wrap: wrap; gap: 0 var(--space-2); }
+.tile-info:not([data-compact]) { row-gap: 1px; }
+.tile-info-rates b { color: var(--accent); }
 .tile-info b { color: #fff; font-weight: 700; }
 .tile-info em { color: #dce8ef; font-style: normal; }
 .tile-info-note { color: #dce8ef; }
@@ -714,6 +716,11 @@ button.primary:hover:not(:disabled) { border-color: var(--accent); background: #
 }
 
 @media (max-width: 760px) {
+  .wall[data-info-overlay="true"] {
+    grid-template-columns: repeat(var(--columns), minmax(180px, 1fr));
+    grid-template-rows: repeat(var(--columns), minmax(170px, auto));
+    overflow: auto;
+  }
   main { height: auto; min-height: 100dvh; }
   .workspace { grid-template-columns: minmax(0, 1fr); }
   .wall { grid-template-rows: repeat(var(--columns), minmax(100px, auto)); }

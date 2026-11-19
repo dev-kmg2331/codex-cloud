@@ -27,6 +27,7 @@ function PlaybackInfo({ session, number, bboxAvailable, bboxEnabled, bboxError, 
   }, [session, bboxAvailable, bboxEnabled, bboxError]);
 
   const numeric = (value, digits = 0) => Number.isFinite(value) ? value.toFixed(digits) : '—';
+  const percent = (value, digits = 1) => Number.isFinite(value) ? `${value.toFixed(digits)}%` : '—';
   const pts = value => Number.isFinite(value) ? `${(value / 1_000_000).toFixed(3)}s` : '—';
   const bitrate = Number.isFinite(stats?.bitrateBps)
     ? stats.bitrateBps >= 1_000_000 ? `${(stats.bitrateBps / 1_000_000).toFixed(2)} Mbps`
@@ -35,7 +36,8 @@ function PlaybackInfo({ session, number, bboxAvailable, bboxEnabled, bboxError, 
   const bboxState = !bboxAvailable ? '미지원' : bboxError ? '오류' : !bboxEnabled ? 'OFF'
     : stats?.appliedBboxPtsUs == null ? '대기' : 'ON';
   const frameId = bboxActive && stats?.frameId != null ? String(stats.frameId) : '—';
-  const bboxAge = bboxActive && Number.isFinite(stats?.heldBboxAgeMs) ? `${numeric(stats.heldBboxAgeMs)}ms` : bboxState;
+  const automaticWait = bboxActive ? `${numeric(stats?.bboxPlayoutDelayMs)}ms` : bboxState;
+  const reasons = stats?.droppedFrameReasons;
 
   if (compact) return <div className="tile-info" data-compact="true" role="group"
     aria-label={`${number}번 타일 재생 정보 요약`} aria-live="off">
@@ -43,11 +45,12 @@ function PlaybackInfo({ session, number, bboxAvailable, bboxEnabled, bboxError, 
       <span>FPS 수/디/표</span><b>{numeric(stats?.receiveFps)}/{numeric(stats?.decodeFps)}/{numeric(stats?.renderFps)}</b>
     </div>
     <div className="tile-info-line">
-      <span>디코드 <b>{numeric(stats?.decodeLatencyMs)}ms</b></span>
+      <span>자동 <b>{automaticWait}</b></span>
       <span>큐/대기 <b>{numeric(stats?.decodeQueueSize)}/{numeric(stats?.pendingFrames)}</b></span>
     </div>
-    <div className="tile-info-line" aria-label="영상과 마지막 BBox의 좌표 기준 시차, 늦은 BBox 수">
-      <span>영상−BBox <b>{bboxAge}</b></span><span>늦음 <b>{numeric(stats?.lateBbox)}</b></span>
+    <div className="tile-info-line" aria-label="최근 5초 표시 버림률과 늦은 BBox 비율">
+      <span>최근 버림 <b>{percent(stats?.dropRatePercent, 0)}</b></span>
+      <span>늦음 <b>{percent(stats?.lateBboxRatePercent, 0)}</b></span>
     </div>
     <div className="tile-info-line tile-info-frame"><span>BBox ID</span><b>{frameId}</b></div>
   </div>;
@@ -67,8 +70,29 @@ function PlaybackInfo({ session, number, bboxAvailable, bboxEnabled, bboxError, 
       <span>그리기 <b>{numeric(stats?.renderDurationMs, 1)} ms</b></span>
     </div>
     <div className="tile-info-line">
-      <span>큐/대기/버림 <b>{numeric(stats?.decodeQueueSize)}/{numeric(stats?.pendingFrames)}/{numeric(stats?.droppedFrames)}</b></span>
-      <span>늦은 BBox <b>{numeric(stats?.lateBbox)}</b></span>
+      <span>자동 대기 <b>{automaticWait}</b></span>
+      <span>큐/표시 대기 <b>{numeric(stats?.decodeQueueSize)}/{numeric(stats?.pendingFrames)}</b></span>
+    </div>
+    <div className="tile-info-line tile-info-rates">
+      <span>표시 버림 최근 5초 <b>{percent(stats?.dropRatePercent)}</b></span>
+      <span>누적 <b>{numeric(stats?.droppedFrames)}</b></span>
+    </div>
+    <div className="tile-info-line tile-info-rates">
+      <span>늦은 BBox 최근 5초 <b>{percent(stats?.lateBboxRatePercent)}</b></span>
+      <span>누적 <b>{numeric(stats?.lateBbox)}</b></span>
+    </div>
+    <div className="tile-info-line tile-info-reasons">
+      <span>원인 최신선택 <b>{numeric(reasons?.coalesced)}</b></span>
+      <span>기한 <b>{numeric(reasons?.expired)}</b></span>
+      <span>큐초과 <b>{numeric(reasons?.overflow)}</b></span>
+    </div>
+    <div className="tile-info-line tile-info-reasons">
+      <span>초기화 <b>{numeric(reasons?.reset)}</b></span>
+      <span>그리기 취소 <b>{numeric(reasons?.renderSkipped)}</b></span>
+    </div>
+    <div className="tile-info-line">
+      <span>디코더 큐 복구 <b>{numeric(stats?.decoderResets)}</b></span>
+      <span>키대기 생략 <b>{numeric(stats?.keyframeWaitFrames)}</b></span>
     </div>
     <div className="tile-info-line tile-info-pts">
       <span>영상 PTS <b>{pts(stats?.lastPresentedPtsUs)}</b></span>
@@ -227,7 +251,8 @@ function Camera({ ref, number, visible, selected, onSelect, onCameraDrop, suppor
     const current = {
       ws, camera: source, decoder: null, needsKey: true, config: null, hardwareAcceleration,
       bboxEnabled: initialBbox, bboxRevision: 0,
-      metrics: { receivedFrames: 0, receivedBytes: 0, decodedFrames: 0, hiddenFrames: 0, decodeLatencyMs: 0, renderDurationMs: 0 },
+      metrics: { receivedFrames: 0, receivedBytes: 0, decodedFrames: 0, hiddenFrames: 0,
+        decodeLatencyMs: 0, renderDurationMs: 0, decoderResets: 0, keyframeWaitFrames: 0 },
       decodeStarts: new Map(), overlayDirty: true, lastStatsAt: -Infinity,
     };
     session.current = current;
@@ -355,6 +380,7 @@ function Camera({ ref, number, visible, selected, onSelect, onCameraDrop, suppor
         current.metrics.receivedFrames++;
         current.metrics.receivedBytes += data.byteLength - 9;
         if (current.decoder.decodeQueueSize > 10) {
+          current.metrics.decoderResets++;
           current.playout.reset();
           current.decodeStarts.clear();
           drawBbox(overlay.current);
@@ -363,7 +389,10 @@ function Camera({ ref, number, visible, selected, onSelect, onCameraDrop, suppor
           current.decoder.configure(current.config);
           current.needsKey = true;
         }
-        if (current.needsKey && !key) return;
+        if (current.needsKey && !key) {
+          current.metrics.keyframeWaitFrames++;
+          return;
+        }
         current.needsKey = false;
         const timestamp = Number(header.getBigInt64(1));
         current.decodeStarts.set(timestamp, performance.now());
@@ -601,6 +630,13 @@ function CameraLibrary({ cameras, selected, supported, onPlay, onRegister, loadE
 }
 
 function App() {
+  const [compactViewport, setCompactViewport] = useState(() => matchMedia('(max-width: 900px)').matches);
+  useEffect(() => {
+    const query = matchMedia('(max-width: 900px)');
+    const update = event => setCompactViewport(event.matches);
+    query.addEventListener('change', update);
+    return () => query.removeEventListener('change', update);
+  }, []);
   const [layout, setLayout] = useState(4);
   const [enableBboxOnPlay, setEnableBboxOnPlay] = useState(false);
   const [accelerationEnabled, setAccelerationEnabled] = useState(() => {
@@ -754,7 +790,7 @@ function App() {
               visible={number <= layout} selected={number === selected} onSelect={() => setSelected(number)}
               onCameraDrop={ids => playCameras(ids, number)} supported={supported}
               hardwareAcceleration={accelerationEnabled ? 'no-preference' : 'prefer-software'} infoOverlay={infoOverlay}
-              compactInfo={layout >= 9} />;
+              compactInfo={layout >= 9 || compactViewport} />;
           })}
         </div>
       </section>
